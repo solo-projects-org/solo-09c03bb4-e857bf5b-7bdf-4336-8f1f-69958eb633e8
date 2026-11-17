@@ -11,6 +11,11 @@ _RECEIPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
+def is_valid_receipt_id(receipt_id: str) -> bool:
+    """接收号格式校验（与声明模型同一口径），供路由层在取锁前使用。"""
+    return bool(_RECEIPT_RE.match(receipt_id))
+
+
 class DeclarationIn(BaseModel):
     """接收声明：站号、UTC 日期、原包长度与 SHA-256。"""
 

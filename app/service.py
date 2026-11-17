@@ -22,7 +22,7 @@ from .errors import (
     ReceiptNotFound,
     UploadNotComplete,
 )
-from .schemas import DeclarationIn
+from .schemas import DeclarationIn, is_valid_receipt_id
 from .storage import (
     FileLock,
     assert_staging_fits,
@@ -297,6 +297,80 @@ def _stream_to_staging(
     return part, total, digest
 
 
+def _digest_of(chunks: list[bytes]) -> tuple[int, str]:
+    """对完整收齐的字节计算实际长度与 SHA-256（在线程池中执行）。"""
+    hasher = hashlib.sha256()
+    total = 0
+    for chunk in chunks:
+        total += len(chunk)
+        hasher.update(chunk)
+    return total, hasher.hexdigest()
+
+
+def _verify_published_retransmit(
+    settings: Settings,
+    db: Database,
+    receipt_id: str,
+    *,
+    total_bytes: int,
+    digest: str,
+) -> dict | None:
+    """已发布接收的同号重传核验（必须在接收锁内调用）。
+
+    只以数据库中**当前仍然有效**的接收记录为准，逐块核对实际长度与
+    SHA-256：
+    - 记录已被删除（同号删除/重建交错）→ ReceiptNotFound(404)，绝不用
+      删除前读到的旧记录应答；
+    - 记录已不再是 PUBLISHED（被对账回退或同号重建为在途接收）→ 返回
+      None，由调用方走完整的落盘、校验、发布流程，对本次实际内容负责；
+    - PUBLISHED 但长度或摘要任一不符 → ContentMismatch(422)。除
+      last_error/updated_at 诊断字段外，接收状态、成品原件与额度账本
+      一律不变；
+    - PUBLISHED 且字节与该次已发布原包完全一致 → 返回当前接收行。
+      额外核对成品文件仍在盘上；若文件已丢失则返回 None 走重发恢复，
+      杜绝缺件成功记录。
+    """
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM receipts WHERE receipt_id = ?", (receipt_id,)
+        ).fetchone()
+        if row is None:
+            raise ReceiptNotFound(f"接收号 {receipt_id} 不存在")
+        if row["state"] != _PUBLISHED:
+            return None
+
+        mismatch: str | None = None
+        if total_bytes != row["declared_size"]:
+            mismatch = (
+                f"长度不符：重发实际收到 {total_bytes} 字节，"
+                f"已发布原包登记 {row['declared_size']} 字节"
+            )
+        elif digest != row["declared_sha256"]:
+            mismatch = (
+                f"摘要不符：重发实际 SHA-256={digest}，"
+                f"已发布原包登记 {row['declared_sha256']}"
+            )
+        current = _row_to_dict(row)
+
+    if mismatch is not None:
+        # 诊断信息在独立事务内先提交，避免随业务异常一起回滚；
+        # 只动 last_error/updated_at，状态、成品与额度均不变
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE receipts SET last_error = ?, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE receipt_id = ?",
+                (mismatch, receipt_id),
+            )
+        raise ContentMismatch(mismatch)
+
+    target = blob_path(settings, current["blob_sha256"]) if current["blob_sha256"] else None
+    if not target or not os.path.isfile(target):
+        # 成品已丢失：本次字节虽与登记一致，也必须走完整发布重建成品
+        return None
+    return current
+
+
 async def upload_package(
     settings: Settings,
     db: Database,
@@ -307,47 +381,75 @@ async def upload_package(
     """流式接收原包：边收边攒块，全部收完后在线程池落盘、校验、发布。
 
     网络读取走 async 迭代不阻塞事件循环；文件、SQLite、Parquet 等同步重活
-    全部进入 I/O 线程池，因此慢上传期间其他包的接收与查询照常处理。
+    全部进入 I/O 线程池，因此慢上传期间其他接收的接收与查询照常处理。
+
+    同号重传的成功结果必须对应本次实际核验的有效接收：
+    1. 先取接收级 flock，再读任何接收记录——与删除/同号重建严格互斥，
+       不会用删除前读到的旧记录应答；
+    2. 已发布接收的重传也要读完整个请求体，按**实际**长度与 SHA-256
+       逐块核对，只有字节与该次已发布原包一致才沿用成功结果；
+    3. 不符明确 422 拒绝，原件、接收状态与额度不变；记录已失效则 404
+       或对当前在途记录走完整发布流程。
     """
-    receipt = await _offload(get_receipt, db, receipt_id)
-    if receipt["state"] == _PUBLISHED:
-        # 幂等重发：内容完全一致则视为成功，否则拒绝且不动既有成品
+    if not is_valid_receipt_id(receipt_id):
+        raise ReceiptNotFound(f"接收号 {receipt_id} 不存在")
+
+    # 同一接收同时只允许一个上传会话（跨进程 flock，进程崩溃内核自动释放）。
+    # 锁在任何记录读取之前获取，保证删除/同号重建与慢重传全程互斥。
+    lock = FileLock(os.path.join(settings.lock_dir, f"rcpt-{receipt_id}.lock"))
+    if not await _offload(lock.acquire, blocking=False):
+        raise ReceiptBusy(f"接收 {receipt_id} 正在被另一个上传会话占用，请稍后重试")
+    try:
+        receipt = await _offload(get_receipt, db, receipt_id)
+
+        # Content-Length 仅为快速拒绝的提示；权威判断以实际收齐的字节为准
         if (
             declared_content_length is not None
             and declared_content_length != receipt["declared_size"]
         ):
             raise ContentMismatch(
-                f"接收 {receipt_id} 已发布，重发长度 {declared_content_length} "
-                f"与登记 {receipt['declared_size']} 不一致"
+                f"长度不符：请求声明 {declared_content_length} 字节，"
+                f"登记长度 {receipt['declared_size']} 字节"
             )
-        return receipt
 
-    # 同一接收同时只允许一个上传会话（跨进程 flock，进程崩溃内核自动释放）
-    lock = FileLock(os.path.join(settings.lock_dir, f"rcpt-{receipt_id}.lock"))
-    if not await _offload(lock.acquire, blocking=False):
-        raise ReceiptBusy(f"接收 {receipt_id} 正在被另一个上传会话占用，请稍后重试")
-    try:
-        # 锁内重新读一次，等待期间状态可能已变化
-        receipt = await _offload(get_receipt, db, receipt_id)
-        if receipt["state"] == _PUBLISHED:
-            return receipt
-
+        # 完整读取请求体并按声明长度封顶；无论发布与否都要消费掉整个 body
         chunks: list[bytes] = []
         total = 0
-        try:
-            async for chunk in stream:
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > receipt["declared_size"]:
+        async for chunk in stream:
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > receipt["declared_size"]:
+                if receipt["state"] == _PUBLISHED:
                     raise ContentMismatch(
-                        f"长度超出声明：已收到 {total} 字节 > "
-                        f"声明 {receipt['declared_size']} 字节"
+                        f"长度超出登记：已收到 {total} 字节 > "
+                        f"已发布原包 {receipt['declared_size']} 字节"
                     )
-                chunks.append(chunk)
-        except ContentMismatch:
-            await _offload(_record_failure, db, receipt_id, "上传中断或超出声明长度，请重新上传")
-            raise
+                await _offload(
+                    _record_failure, db, receipt_id, "上传中断或超出声明长度，请重新上传"
+                )
+                raise ContentMismatch(
+                    f"长度超出声明：已收到 {total} 字节 > "
+                    f"声明 {receipt['declared_size']} 字节"
+                )
+            chunks.append(chunk)
+
+        # 已发布接收的同号重传：以锁内当前有效记录为准核验实际字节
+        if receipt["state"] == _PUBLISHED:
+            total_bytes, digest = await _offload(_digest_of, chunks)
+            confirmed = await _offload(
+                _verify_published_retransmit,
+                settings,
+                db,
+                receipt_id,
+                total_bytes=total_bytes,
+                digest=digest,
+            )
+            if confirmed is not None:
+                return confirmed
+            # 记录已失效（删除后同号重建在途 / 对账回退 / 成品丢失）：
+            # 刷新为当前记录，对本次实际内容走完整发布流程
+            receipt = await _offload(get_receipt, db, receipt_id)
 
         try:
             _part, total_written, digest = await _offload(
@@ -362,8 +464,12 @@ async def upload_package(
 
         try:
             receipt = await _offload(
-                _finish_upload, settings, db,
-                receipt_id=receipt_id, total_bytes=total_written, digest=digest,
+                _finish_upload,
+                settings,
+                db,
+                receipt_id=receipt_id,
+                total_bytes=total_written,
+                digest=digest,
             )
             return await _offload(_publish, settings, db, receipt)
         except (InvalidPackage, ContentMismatch) as exc:

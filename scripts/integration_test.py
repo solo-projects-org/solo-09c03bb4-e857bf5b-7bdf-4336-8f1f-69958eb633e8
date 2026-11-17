@@ -11,6 +11,8 @@
   6. 慢上传期间另一实例仍可接收与查询（不阻塞）
   7. 配额不足 507
   8. 崩溃回收：伪造孤儿暂存后调 /admin/reconcile 被清理
+  9. 同号重传严格核验：同长度异内容 422 且原件/状态/额度不变；
+     完全一致才确认；删除后重传 404；同号重建走完整发布
 """
 
 from __future__ import annotations
@@ -92,6 +94,27 @@ def decl(rid: str, data: bytes, sha: str, **over) -> dict:
          "size": len(data), "sha256": sha}
     p.update(over)
     return p
+
+
+def same_length_other_content(data: bytes) -> bytes:
+    """构造等长但 SHA-256 不同的另一份 Parquet 字节（用于重传严格核验）。"""
+    table = pq.read_table(pa.BufferReader(data))
+    col = table.column("salinity").to_pylist()
+    col[0] = col[0] + 1.5
+    patched = table.set_column(
+        table.schema.get_field_index("salinity"),
+        "salinity",
+        pa.array(col, pa.float64()),
+    )
+    sink = pa.BufferOutputStream()
+    pq.write_table(patched, sink)
+    other = sink.getvalue().to_pybytes()
+    if len(other) < len(data):
+        other += b"\x00" * (len(data) - len(other))
+    other = other[: len(data)]
+    assert len(other) == len(data)
+    assert hashlib.sha256(other).hexdigest() != hashlib.sha256(data).hexdigest()
+    return other
 
 
 def main() -> int:
@@ -220,7 +243,63 @@ def main() -> int:
     check("对账清理孤儿暂存", code == 200 and info["removed_staging_files"] >= 1
           and not staging.exists(), str(info))
 
-    print("== 8. 已发布数据最终完整性 ==")
+    print("== 8. 同号重传严格核验（跨双实例） ==")
+    dr, dsha = make_parquet("p_rt.parquet", salt=7.0)
+    rt_rid = "IT-RETRANSMIT"
+    req("PUT", BASE1, f"/receipts/{rt_rid}/declaration", decl(rt_rid, dr, dsha))
+    code, body, _ = req("POST", BASE1, f"/receipts/{rt_rid}/content", dr, raw=True)
+    check("重传基线：首次发布成功", code == 200
+          and json.loads(body)["state"] == "PUBLISHED", body[:160].decode())
+    blob_path_ = pathlib.Path(os.environ["OBS_DATA_DIR"]) / "blobs" / dsha[:2] / dsha
+    before_bytes = blob_path_.read_bytes()
+    q_before = json.loads(req("GET", BASE2, "/quota")[1])
+    row_before = json.loads(req("GET", BASE2, f"/receipts/{rt_rid}")[1])
+
+    # 8.1 同长度异内容：实例2 重传，必须 422，且原件/状态/额度不变
+    other = same_length_other_content(dr)
+    code, body, _ = req("POST", BASE2, f"/receipts/{rt_rid}/content", other, raw=True)
+    check("同长度异内容重传 422", code == 422
+          and json.loads(body)["error"]["code"] == "content_mismatch",
+          f"{code} {body[:160]!r}")
+    check("拒绝后原件字节不变", blob_path_.read_bytes() == before_bytes)
+    row_after = json.loads(req("GET", BASE1, f"/receipts/{rt_rid}")[1])
+    check("拒绝后接收状态/引用不变",
+          row_after["state"] == "PUBLISHED"
+          and row_after["blob_sha256"] == row_before["blob_sha256"]
+          and row_after["bytes_received"] == row_before["bytes_received"])
+    q_after = json.loads(req("GET", BASE1, "/quota")[1])
+    check("拒绝后额度账本不变", q_after == q_before, str(q_after))
+
+    # 8.2 长度不符（不带任何特殊头，按实际字节核算）
+    code, _, _ = req("POST", BASE1, f"/receipts/{rt_rid}/content", dr + b"\x00", raw=True)
+    check("重传长度不符 422", code == 422)
+
+    # 8.3 完全一致的原包重传：跨实例确认成功，可下载
+    code, body, _ = req("POST", BASE2, f"/receipts/{rt_rid}/content", dr, raw=True)
+    check("一致原包重传确认成功", code == 200
+          and json.loads(body)["state"] == "PUBLISHED")
+    code, body, _ = req("GET", BASE1, f"/receipts/{rt_rid}/download")
+    check("重传确认后下载仍为原件", code == 200 and body == dr)
+
+    # 8.4 另一实例先删除：旧请求不得确认已失效记录，重传 404
+    code, _, _ = req("DELETE", BASE1, f"/receipts/{rt_rid}")
+    check("另一实例删除接收 204", code == 204, str(code))
+    code, body, _ = req("POST", BASE2, f"/receipts/{rt_rid}/content", dr, raw=True)
+    check("删除后重传 404 而非套用旧成功", code == 404
+          and json.loads(body)["error"]["code"] == "receipt_not_found",
+          f"{code} {body[:160]!r}")
+
+    # 8.5 同号重建后重传：按新的在途接收走完整发布
+    code, _, _ = req("PUT", BASE2, f"/receipts/{rt_rid}/declaration",
+                     decl(rt_rid, dr, dsha))
+    check("同号重新声明 200 且为在途", code == 200)
+    code, body, _ = req("POST", BASE1, f"/receipts/{rt_rid}/content", dr, raw=True)
+    check("同号重建后重传完整发布成功", code == 200
+          and json.loads(body)["state"] == "PUBLISHED", body[:160].decode())
+    check("重建后可下载且字节一致",
+          req("GET", BASE2, f"/receipts/{rt_rid}/download")[1] == dr)
+
+    print("== 9. 已发布数据最终完整性 ==")
     code, body, _ = req("GET", BASE1, "/receipts", )
     states = {r["receipt_id"]: r["state"] for r in json.loads(body)}
     check("成功记录均为 PUBLISHED",

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -71,7 +72,17 @@ class Database:
             timeout=30.0,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode=WAL 是一次需要排他锁的写操作，且不经过 busy_timeout；
+        # 双实例同时首建/同时崩溃重启时可能撞上 SQLITE_BUSY，做有限重试。
+        # 数据库已处于 WAL 时该 pragma 为只读返回，不会再竞争。
+        for attempt in range(30):
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 29:
+                    raise
+                time.sleep(0.1)
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")

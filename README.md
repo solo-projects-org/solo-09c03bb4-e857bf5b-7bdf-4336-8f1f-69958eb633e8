@@ -16,6 +16,8 @@
 | 包内含站号、UTC 时刻、盐度三列，逐行站号/站日符合声明 | `app/validation.py` 用 PyArrow 逐行校验，保留全部原始行（只读不改写） |
 | 每次接收独立留档，可查进度、下载原件 | `receipts` 表每接收一行；`GET /receipts`、`GET /receipts/{id}`、`.../download` |
 | 同号同声明重试沿用原记录，异声明拒绝 | 声明幂等；四要素任一不同返回 `409 declaration_conflict` |
+| 已发布接收的同号重传逐块核验 | 读完整个请求体，按**实际**长度与 SHA-256 核对；字节与该次已发布原包一致才沿用成功结果，不符 `422 content_mismatch`，原件/接收状态/额度不变 |
+| 删除/同号重建与慢重传交错不确认失效记录 | 接收锁在任何记录读取之前获取；成功结果只对应锁内重查到的有效接收，记录已删返回 `404`，同号重建在途则走完整发布 |
 | 配置原包字节额度，暂存与成品共用 | `OBS_QUOTA_BYTES`；口径 = 成品 blob + 在途暂存 |
 | 相同内容跨接收只存一份、不重复占额 | 内容寻址 `blobs/<sha 前2位>/<sha>` + `ref_count`，硬链接发布 |
 | 空间不足明确拒收 | `507 quota_exceeded`，落盘/发布前按实际内容核算 |
@@ -111,6 +113,13 @@ curl -X POST http://localhost:8080/receipts/RCV-0001/content \
 依次通过 **长度 → SHA-256 → Parquet 三列与逐行站号/站日** 三关后发布为
 `PUBLISHED`；任一失败返回 `422`，接收保持 `UPLOADING` 可重传，且**不产生成品**。
 
+> **同号重传确认（已发布接收）**：服务会读完整个重传请求体，按**实际**收到的
+> 长度与 SHA-256 逐块核对，只有字节与该次已发布原包完全一致才沿用成功结果；
+> 长度或摘要不符一律 `422 content_mismatch` 明确拒绝，原件、接收状态与额度账本
+> 均不变（仅写 `last_error` 诊断）。`Content-Length` 头只作快速提示，权威判断以
+> 实际字节为准。接收在核验前被另一实例删除的，重传得到 `404` 而不会套用删除前
+> 的旧记录；删除后同号重建为在途接收的，重传按新声明走完整落盘、校验与发布。
+
 ### 查询与下载
 
 ```bash
@@ -136,8 +145,11 @@ curl -X POST http://localhost:8080/admin/reconcile          # 手动触发回收
 ## 5. 并发与崩溃安全设计
 
 1. **SQLite 多进程共享**：WAL + `busy_timeout` + `BEGIN IMMEDIATE`，写事务跨实例串行化。
+   `journal_mode=WAL` 切换不经过 `busy_timeout`，双实例同时首建时对该 pragma 做有限
+   重试，避免启动偶发 `database is locked`。
 2. **接收级 flock**：同一接收号同时只允许一个上传会话，冲突返回 `409 receipt_busy`；
-   不同接收号互不阻塞。进程崩溃时内核自动释放锁。
+   不同接收号互不阻塞。进程崩溃时内核自动释放锁。上传在**读取任何接收记录之前**
+   先取该锁，因此删除/同号重建与慢重传全程互斥，成功结果只对应锁内重查到的有效接收。
 3. **全局 flock**：发布与对账互斥，保证回收不会与在途发布竞争。
 4. **原子发布**：成品先写 `.tmp` 再 `rename`；内容已存在则只增 `ref_count`，不重复占额。
 5. **对账（reconcile）**：启动即执行，之后每 `OBS_RECONCILE_INTERVAL` 秒一次——
@@ -161,7 +173,7 @@ curl -X POST http://localhost:8080/admin/reconcile          # 手动触发回收
 
 ```bash
 pip install pytest httpx pyarrow
-python -m pytest tests/                  # 29 个用例（含并发、配额、崩溃回收）
+python -m pytest tests/                  # 40 个用例（含并发、配额、崩溃回收、重传交错）
 python -W error -m pytest tests/         # 严格模式（资源告警也视为失败）
 
 # 真实双进程端到端：先按方式 B 启动两实例，再执行
@@ -170,7 +182,9 @@ OBS_DATA_DIR=/tmp/obs-e2e python -I scripts/integration_test.py
 
 测试覆盖：完整发布/下载往返、幂等与冲突、长度/摘要/Parquet/站号/站日五类拒绝、
 去重占额、配额 507、慢上传不阻塞、同接收并发互斥、孤儿暂存/缺件成品回收、
-双 Database 连接共享状态等。
+双 Database 连接共享状态，以及同号重传专项——同长度异内容拒绝且原件/状态/额度
+不变、一致原包确认、删除后重传 404、同号重建完整发布、删除与慢重传多轮交错
+（成功应答与记录已删除永不共存）、交错期间其他接收继续入湖。
 
 ---
 

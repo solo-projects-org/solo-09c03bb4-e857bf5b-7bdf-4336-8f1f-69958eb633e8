@@ -82,6 +82,11 @@ app = FastAPI(
         "流程：按接收号 **声明**（站号、UTC 日期、长度、SHA-256）→ "
         "**上传原包** → 长度/摘要/Parquet 内容全部通过后发布。\n\n"
         "- 同号同声明重试沿用原记录，异声明拒绝（409）；\n"
+        "- 已发布接收的同号重传逐块核对**实际**长度与 SHA-256，只有字节与"
+        "该次已发布原包一致才沿用成功结果；不符返回 422，原件、接收状态与"
+        "额度均不变；\n"
+        "- 接收已被删除（含同号重建交错）时重传不会套用旧记录，按当前有效"
+        "接收核验，记录不存在返回 404；\n"
         "- 相同内容跨接收只存一份（内容寻址），不重复占额；\n"
         "- 空间不足返回 507；校验失败无可下载成品；\n"
         "- 双实例共享存储，崩溃残留由启动与周期对账自动回收。"
@@ -135,7 +140,7 @@ async def declare(receipt_id: str, decl: DeclarationIn) -> ReceiptOut:
     "/receipts/{receipt_id}/content",
     response_model=UploadResult,
     tags=["接收"],
-    summary="2. 上传原包（流式，body 为 Parquet 原始字节）",
+    summary="2. 上传原包（流式，body 为 Parquet 原始字节；同号重传逐块核验）",
     status_code=status.HTTP_200_OK,
 )
 async def upload(receipt_id: str, request: Request) -> UploadResult:
